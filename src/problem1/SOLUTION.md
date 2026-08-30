@@ -51,38 +51,51 @@ feature store, and a separate offline/batch path for training.
 
 ```mermaid
 flowchart LR
-    BackendCallers(["Trading / Wallet / Account services"])
+    Users(["Users / external clients"])
+    PartnerSystems(["Internal schedulers / partner systems"])
 
-    subgraph SYNC["Sync: fraud decision"]
-        direction LR
-        ALB["ALB"]
-        NGINX["nginx"]
-        RiskAPI["Risk Decision API"]
-        ALB --> NGINX --> RiskAPI
-        RiskAPI --> Decision{{"ALLOW / REVIEW / BLOCK"}}
-    end
+    subgraph AWS["AWS Region"]
+        subgraph VPC["VPC private subnets"]
+            ProductServices["Trading / Wallet / Account services"]
 
-    subgraph ONLINE["Online feature store"]
-        Redis[("ElastiCache for Redis<br/>cluster mode disabled, Multi-AZ")]
-    end
+            subgraph SYNC["Sync: fraud decision"]
+                direction LR
+                ALB["Internal ALB"]
+                NGINX["nginx"]
+                RiskAPI["Risk Decision API"]
+                ALB --> NGINX --> RiskAPI
+                RiskAPI --> Decision{{"ALLOW / REVIEW / BLOCK"}}
+            end
 
-    subgraph ASYNC["Async: feature refresh & training"]
-        Events(["Risk events"])
-        Stream["Kinesis"]
-        Worker["Feature Worker"]
-        ClickHouse[("Offline ClickHouse")]
-        S3Data[("S3")]
-        Training["Training job"]
+            subgraph ONLINE["Online feature store"]
+                Redis[("ElastiCache for Redis")]
+            end
+
+            subgraph ASYNC["Async: feature refresh & training"]
+                Events(["Risk events"])
+                Worker["Feature Worker"]
+                ClickHouse[("Offline ClickHouse")]
+                Training["Training job"]
+
+                Worker --> ClickHouse
+                ClickHouse --> Training
+            end
+        end
+
+        subgraph MANAGED["AWS managed data services"]
+            Stream["Kinesis"]
+            S3Data[("S3")]
+        end
 
         Events --> Stream --> Worker
-        Worker --> ClickHouse
         Worker --> S3Data
-        ClickHouse --> Training
         S3Data --> Training
     end
 
-    BackendCallers -->|"sync risk check before commit"| ALB
-    BackendCallers -->|"async risk event after action"| Events
+    Users -->|"trade / withdrawal / login request"| ProductServices
+    PartnerSystems -->|"system action / webhook / scheduled job"| ProductServices
+    ProductServices -->|"sync risk check before commit"| ALB
+    ProductServices -->|"async risk event after action"| Events
     RiskAPI -->|"sync feature read"| Redis
     Worker -->|"async online feature write"| Redis
     Training -->|"model artifact"| S3Data
@@ -91,9 +104,11 @@ flowchart LR
     classDef sync fill:#e8f3ff,stroke:#2563eb,color:#111827;
     classDef async fill:#eef8ec,stroke:#2f855a,color:#111827;
     classDef store fill:#fff7e6,stroke:#b7791f,color:#111827;
+    classDef caller fill:#f8fafc,stroke:#475569,color:#111827;
     class ALB,NGINX,RiskAPI,Decision sync;
     class Events,Stream,Worker,ClickHouse,S3Data,Training async;
     class Redis store;
+    class Users,PartnerSystems,ProductServices caller;
 ```
 
 The diagram has two paths. The **sync path** is the request-time path: the user action
@@ -101,10 +116,11 @@ waits for the Risk Decision API to read Redis, score the request, and return ALL
 REVIEW, or BLOCK. The **async path** runs continuously in the background: events update
 Redis and ClickHouse, then feed batch training and model artifacts.
 
-The trading, wallet, and account services have two responsibilities: call the sync risk
-check before committing a high-risk action, and emit async risk events after product
-actions such as order placement, withdrawal, login, device change, API-key change, or
-profile change.
+The trading, wallet, and account services live inside the VPC and are triggered by user
+requests, partner callbacks, scheduled jobs, or internal system actions. They have two
+responsibilities: call the sync risk check before committing a high-risk action, and
+emit async risk events after product actions such as order placement, withdrawal, login,
+device change, API-key change, or profile change.
 
 ### 1.2 Observability diagram
 
@@ -155,16 +171,16 @@ CloudWatch path as the other two managed services.
 Observability is deliberately not just Prometheus and Grafana. Prometheus covers
 metrics on the pieces this design still self-hosts (nginx, Risk API, worker,
 ClickHouse); CloudWatch covers native AWS service metrics that Prometheus cannot scrape
-(ALB, Kinesis, ElastiCache) plus centralized decision logs; X-Ray gives per-request
-tracing across the five-hop synchronous path. See §2.10 for why each piece is there, and
-what alerting is deliberately not covered here.
+(ALB, Kinesis, ElastiCache) plus centralized decision logs; X-Ray gives sampled tracing
+across the five-hop synchronous path. See §2.10 for why each piece is there, and what
+alerting is deliberately not covered here.
 
 ### 1.3 Component roles
 
 | Component | Role | Placement |
 |---|---|---|
-| ALB | Managed ingress, multi-AZ health checks, listener routing | Public subnets, 2 AZ |
-| nginx (EC2) | Load shedding, buffering, upstream keepalive, ms-level timeouts, degraded-mode fallback | Public subnets, ASG, 2 AZ |
+| ALB | Internal managed ingress, multi-AZ health checks, listener routing | VPC private subnets, 2 AZ |
+| nginx (EC2) | Load shedding, buffering, upstream keepalive, ms-level timeouts, degraded-mode fallback | VPC private subnets, ASG, 2 AZ |
 | Risk Decision API | Rules engine + in-process ML inference → decision | ECS on EC2 Graviton, private subnets, 2 AZ |
 | ElastiCache for Redis | Online feature store, sub-5ms reads, managed Multi-AZ failover | Managed, cluster mode disabled, 2 AZ |
 | Kinesis | Durable, replayable event transport | Managed |
@@ -180,7 +196,7 @@ what alerting is deliberately not covered here.
 ### 1.4 Monitoring signals and actions
 
 Prometheus scrapes self-hosted components; CloudWatch holds native AWS service metrics
-and decision logs; X-Ray traces requests across the five hops of the synchronous path.
+and decision logs; X-Ray samples requests across the five hops of the synchronous path.
 Grafana is the single pane over both metric sources. Alerting/paging is not covered by
 this design pass — see §2.10 for what that leaves open.
 
@@ -195,7 +211,7 @@ this design pass — see §2.10 for what that leaves open.
 | Kinesis | incoming bytes/records, throttles, iterator age | CloudWatch | Add shards; reduce event size; let workers replay backlog |
 | Feature worker | consumer lag, processing latency, error rate, Redis/ClickHouse write latency | Prometheus | Scale workers; pause bad feature rollout; replay from checkpoint |
 | ClickHouse | disk free, insert latency, rejected inserts, query p95, merge backlog | Prometheus | Scale disk/CPU; pause heavy queries; restore/rebuild from S3 if node fails |
-| Cross-hop latency | per-request trace, which hop owns the tail | X-Ray | Isolate the offending hop instead of guessing from aggregate p99s |
+| Cross-hop latency | sampled traces showing which hop owns the tail | X-Ray | Isolate the offending hop instead of guessing from aggregate p99s |
 | Decision audit | structured log per decision: features used, rule fired, model version, outcome | CloudWatch Logs | Answer "why was this decision made" for disputes/compliance review |
 | Model quality | model version age, score distribution drift, allow/review/block rate changes | ClickHouse (batch) | Roll back model; retrain; increase manual review threshold |
 | Cost | cost per 1M decisions, EC2 utilization, Kinesis shard cost, data transfer | CloudWatch + CUR | Rightsize EC2; choose Savings Plans/Spot; move to Kafka/Redpanda only when cheaper at scale |
@@ -241,8 +257,10 @@ missing features always downgrade the decision to `REVIEW`.
 
 ### 2.2 API ingress — ALB + nginx on EC2
 
-ALB handles AWS-managed ingress: multi-AZ target health checks, managed listener/routing,
-simpler failover than DNS pointed directly at EC2, no custom failover scripts to write.
+The Risk API uses an **internal ALB**, because its callers are backend trading, wallet,
+and account services inside the platform network. It is not a public internet edge. ALB
+handles managed ingress, multi-AZ target health checks, listener routing, and failover
+without hand-built DNS or instance-discovery logic.
 
 nginx sits behind ALB because it expresses controls ALB does not: `limit_req` load
 shedding, request buffering, upstream keepalive, millisecond-level proxy timeouts, and a
@@ -252,19 +270,23 @@ conservative fallback response when every backend is down.
 limit_req_zone $http_x_api_key zone=perkey:10m rate=200r/s;
 limit_req zone=perkey burst=100 nodelay;
 
-proxy_connect_timeout 100ms;
-proxy_read_timeout 200ms;
+proxy_connect_timeout 20ms;
+proxy_read_timeout 60ms;
 proxy_next_upstream error timeout http_502 http_503;
-proxy_next_upstream_timeout 250ms;
+proxy_next_upstream_timeout 80ms;
 
 resolver 169.254.169.253 valid=10s ipv6=off;
 set $upstream risk-api.risk.local;
 proxy_pass http://$upstream:8080;
 ```
 
-This combination is not cheaper than nginx alone — it is more cost-effective for a
-*public* product, since ALB removes fragile origin-failover work while nginx still
-protects the p99 SLO.
+These timeouts deliberately stay below the 100ms SLO. If the Risk API or Redis path is
+slow, nginx should return a conservative `REVIEW` response instead of waiting long
+enough to violate the caller's latency budget.
+
+This combination is not cheaper than nginx alone, but it is more cost-effective for a
+high-availability internal service: ALB removes fragile failover work while nginx still
+enforces load shedding and the hard request deadline.
 
 **Alternatives:**
 
@@ -273,7 +295,7 @@ protects the p99 SLO.
 | ALB alone | No load shedding, no sub-second timeout control, no upstream keepalive pool, no fallback when every task is down |
 | Shed load in application code | A request that reaches the app has already cost a connection and a worker slot — shedding is only cheap at the edge |
 | API Gateway | $1.00–3.50 per million requests → far more than nginx at this volume |
-| nginx alone, no ALB | Inherits certificate renewal, health checking, and DNS-based AZ failover by hand |
+| nginx alone, no ALB | Inherits health checking, service discovery, and AZ failover by hand |
 
 ### 2.3 Compute — ECS on EC2 Graviton
 
@@ -426,7 +448,9 @@ left open on purpose:
   AWS bill (§2.11 pulls that from **AWS CUR**).
 - **No tracing.** Aggregate per-component p99 (Prometheus) doesn't show whether the same
   requests are slow across multiple hops, which matters directly for a 5-hop, ~15-30ms
-  budget. **X-Ray** is close to free at 500 RPS (100k traces/month free tier).
+  budget. **X-Ray** is used with aggressive sampling: trace errors and a small
+  percentage of successful requests, because tracing every request at 500 RPS would be
+  wasteful and can exceed the free tier quickly.
 - **No centralized logs**, which is also a compliance gap: a fraud decision needs an
   answer to "why was this blocked," not just a latency number. **CloudWatch Logs** holds
   the per-decision audit trail.
@@ -455,7 +479,7 @@ direct upgrade paths.
 
 | Area | Choice | Why |
 |---|---|---|
-| API ingress | ALB + nginx on EC2 | Managed failover plus nginx's p99 controls |
+| API ingress | Internal ALB + nginx on EC2 | Managed failover plus nginx's p99 controls |
 | Compute | ECS on EC2 Graviton | Predictable resource control, lower steady cost than Fargate |
 | Online features | ElastiCache for Redis, cluster mode disabled | Managed Multi-AZ failover without a self-run Sentinel quorum or 3rd AZ; single small shard keeps the premium modest |
 | Stream transport | Kinesis, provisioned | Managed and cheap enough at 500 RPS |
@@ -463,11 +487,11 @@ direct upgrade paths.
 | Offline store | ClickHouse on EC2 | Cheap analytical scans and compression |
 | Batch ML | EC2 Spot | Avoids always-on Spark/SageMaker cost |
 | Ops state | DynamoDB, on-demand | Cheap for review queue / idempotency |
-| Observability | Prometheus/Grafana + CloudWatch + X-Ray | Avoids expensive SaaS monitoring baseline; X-Ray is near-zero marginal cost at 500 RPS |
+| Observability | Prometheus/Grafana + CloudWatch + sampled X-Ray | Avoids expensive SaaS monitoring baseline; tracing is sampled to control cost |
 
 The largest savings do **not** come from removing ALB — they come from avoiding
-Fargate, EKS, managed Redis, Redshift, SageMaker endpoints, API Gateway, and always-on
-Flink/Spark before the workload actually needs them.
+Fargate, EKS, managed sharded Redis, MemoryDB, Redshift, SageMaker endpoints, API
+Gateway, and always-on Flink/Spark before the workload actually needs them.
 
 ### 2.12 Deliberately left out
 
@@ -548,7 +572,7 @@ Only replace a component when its metric proves it has become the bottleneck.
 
 | Layer | Baseline |
 |---|---|
-| ALB | Public API ingress |
+| ALB | Internal API ingress |
 | nginx | 2 small EC2 instances behind ALB |
 | ECS | 2–3 Graviton nodes |
 | Risk API | 2–4 tasks |
@@ -591,7 +615,7 @@ This is where the high-scale boxes in the Part 3 diagram become real components.
 ### 3.5 Target-state summary
 
 ```
-API ingress         → ALB + nginx on EC2
+API ingress         → Internal ALB + nginx on EC2
 Online prediction   → ECS Risk API + Redis + in-process ML model
 Stream transport     → Kinesis first; Kafka/Redpanda later if cost demands
 Stream processing    → ECS worker first; Flink later for stateful feature logic
@@ -599,7 +623,7 @@ Offline analytics    → ClickHouse on EC2
 Batch ML             → EC2 Spot first; Spark later for large batch work
 Archive/backups      → S3
 Review/idempotency    → DynamoDB
-Observability         → Prometheus + Grafana + CloudWatch (metrics/logs/alarms) + X-Ray + CUR
+Observability         → Prometheus + Grafana + CloudWatch (metrics/logs) + sampled X-Ray + CUR
 ```
 
 The core of real-time fraud detection is keeping model features fresh while the online
