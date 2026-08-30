@@ -1,0 +1,63 @@
+# systemd unit for the backend container.
+#
+# The unit ships inside the CodeDeploy revision rather than being baked into the
+# AMI so that a change to how the application runs (memory limit, log driver,
+# restart policy) goes through the same reviewed pipeline as a change to the
+# application itself.
+[Unit]
+Description=Backend API
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/app/release.env
+Restart=on-failure
+RestartSec=5s
+# Give in-flight requests time to finish before SIGKILL. Must exceed the ALB's
+# deregistration delay, or draining is pointless.
+TimeoutStopSec=45
+
+ExecStartPre=-/usr/bin/docker rm -f app
+ExecStart=/usr/bin/docker run \
+    --name app \
+    --rm \
+    --pull never \
+    --publish 8080:8080 \
+    --env-file /etc/app/release.env \
+    --env AWS_REGION=ap-southeast-1 \
+    --memory 1g \
+    --cpus 1.0 \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --log-driver awslogs \
+    --log-opt awslogs-group=/app/backend \
+    --log-opt awslogs-stream=%H \
+    ${IMAGE_URI}
+
+ExecStop=/usr/bin/docker stop --time 40 app
+
+[Install]
+WantedBy=multi-user.target
+
+# Notes on the hardening flags above, since they are the kind of thing a reviewer
+# should be able to challenge:
+#
+#   --pull never       the image was pulled in AfterInstall, where a registry
+#                      failure is still recoverable. Pulling here would mean the
+#                      old container is already gone when the registry is down.
+#   --read-only        the application writes only to /tmp and to stdout. A
+#                      writable root filesystem is how a code-execution bug
+#                      becomes persistence.
+#   --cap-drop ALL     an HTTP API on port 8080 needs no Linux capabilities.
+#   8080:8080           the host listens on its VPC interface so the ALB can reach
+#                      it. The instance security group permits this port only from
+#                      the ALB security group; it is not public ingress.
+#   --memory 1g        a leak kills one container and restarts it, instead of
+#                      OOM-killing the host and taking the CodeDeploy agent with
+#                      it — which would leave the instance undeployable.

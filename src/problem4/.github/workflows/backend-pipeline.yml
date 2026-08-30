@@ -1,0 +1,696 @@
+# Backend delivery pipeline — HTTP API on EC2 (ASG behind an ALB).
+#
+# Invariant this file exists to protect:
+#   The image digest that reaches production is the exact digest that passed
+#   staging. Built once, promoted twice. No job in this file ever rebuilds.
+#
+# On pull_request      : quality gate only. Nothing is pushed, nothing is deployed.
+# On push to main      : build -> staging -> smoke -> [human approval] -> production.
+# On workflow_dispatch : build -> dev. Any branch, no approval. This is the
+#                        "does my change work on real AWS" path, and it is a dead
+#                        end by design — nothing is ever promoted out of dev.
+#
+# Action refs use major tags for readability. In a real repository these must be
+# pinned to full commit SHAs (see SOLUTION.md §"Supply chain") — a mutable tag is
+# an unreviewed write path into your AWS account.
+name: backend
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "deploy/**"
+      - ".github/workflows/backend-pipeline.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "deploy/**"
+      - ".github/workflows/backend-pipeline.yml"
+  # Deploy the dispatched ref to dev. Deliberately input-free: the thing deployed
+  # is the branch you launched it from, so there is no way to deploy one commit
+  # while believing you deployed another.
+  workflow_dispatch:
+
+# One backend pipeline per ref. PR runs are cancelled when superseded (the old
+# result is worthless); main runs are never cancelled, because cancelling
+# mid-deploy leaves the fleet half-upgraded.
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default to read-only. Jobs that need more (id-token for OIDC, checks for test
+# reports) opt in individually.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  # Fail the build if fixable HIGH/CRITICAL CVEs are present in the image.
+  TRIVY_SEVERITY: HIGH,CRITICAL
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1 — static analysis. Cheap, fully parallel, no AWS credentials needed.
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history to scan the whole branch, not just the tip.
+          fetch-depth: 0
+          # Do not leave a usable GITHUB_TOKEN in .git/config for later steps.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      # `npm ci` not `npm install`: install exactly the lockfile, fail if the
+      # lockfile and package.json disagree.
+      - run: npm ci
+        working-directory: backend
+
+      - name: lint
+        run: npm run lint
+        working-directory: backend
+
+      - name: typecheck
+        run: npm run typecheck
+        working-directory: backend
+
+      - name: dockerfile lint (hadolint)
+        uses: hadolint/hadolint-action@v3
+        with:
+          dockerfile: backend/Dockerfile
+          failure-threshold: warning
+
+      # Secrets scanning is separate from SAST on purpose: a leaked credential is
+      # an incident even when the code is perfect, and it needs a different fix
+      # (rotate, then remove) than a code finding.
+      - name: secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SAST (semgrep)
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/ci p/nodejsscan p/secrets
+
+  # ---------------------------------------------------------------------------
+  # Gate 2 — unit tests with an enforced coverage floor.
+  # ---------------------------------------------------------------------------
+  unit-test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write # publish the JUnit report as a check run
+      pull-requests: write # coverage summary comment
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+        working-directory: backend
+
+      # --coverage with a threshold configured in jest.config.js (or vitest).
+      # The threshold lives in the repo, not the workflow, so a developer can
+      # reproduce the failure locally with one command.
+      - name: run unit tests
+        run: npm run test:unit -- --ci --coverage --reporters=default --reporters=jest-junit
+        working-directory: backend
+        env:
+          JEST_JUNIT_OUTPUT_FILE: reports/unit.xml
+
+      # Always publish, including on failure — a red pipeline with no visible
+      # test names is a pipeline people learn to ignore.
+      - name: publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: backend/reports/unit.xml
+          check_name: unit tests
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Gate 3 — integration tests against a real Postgres.
+  #
+  # A mocked database proves your mocks agree with themselves. Migrations, unique
+  # constraints, transaction behaviour and connection-pool exhaustion — the
+  # failures that actually page you — only show up against the real engine.
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    services:
+      postgres:
+        # Pin the minor version to match production. "postgres:16" drifts.
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports: ["5432:5432"]
+        # Without this the test job races the database on cold starts and fails
+        # ~1 run in 20 — the classic "flaky CI" that is not flaky at all.
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+        working-directory: backend
+
+      # Run migrations as a distinct step: a migration failure and a test failure
+      # have different owners and different fixes, so they get different lines in
+      # the log.
+      - name: apply migrations
+        run: npm run migrate:up
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://app:app@localhost:5432/app_test
+
+      - name: run integration tests
+        run: npm run test:integration -- --ci --reporters=default --reporters=jest-junit
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://app:app@localhost:5432/app_test
+          JEST_JUNIT_OUTPUT_FILE: reports/integration.xml
+
+      - name: publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: backend/reports/integration.xml
+          check_name: integration tests
+
+  # ---------------------------------------------------------------------------
+  # Build the one artifact.
+  #
+  # On a PR: build and scan, then throw it away. Scanning before merge is the
+  # point — finding a CRITICAL CVE after the image is already in ECR is finding
+  # it too late.
+  # On main: push to ECR and emit the immutable digest that every later job uses.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build image
+    needs: [static-analysis, unit-test, integration-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # OIDC -> AWS. No long-lived access keys exist anywhere.
+      security-events: write # upload Trivy SARIF to code scanning
+    outputs:
+      # The contract for the rest of the pipeline: a digest, never a tag.
+      # Tags can be moved; a digest cannot. "Promote the tested artifact" is only
+      # true if what you promote is content-addressed.
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: compute image reference
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${{ vars.ECR_REPOSITORY_URL }}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "repository=${IMAGE_URI##*/}" >> "$GITHUB_OUTPUT"
+
+      # Assume the build role only when we are actually going to push. PR builds
+      # never touch AWS at all, which means a fork PR cannot obtain credentials.
+      - name: configure AWS credentials (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BACKEND_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: login to ECR
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # PR path: build to the local docker daemon so Trivy can scan it.
+      - name: build (pull request)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          load: true
+          push: false
+          tags: backend:pr-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: vulnerability scan (pull request)
+        if: github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: backend:pr-${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          # Only fail on CVEs that have a fix available. Blocking every release on
+          # an unfixable base-image CVE trains the team to pass --no-verify, which
+          # costs more security than it buys.
+          ignore-unfixed: true
+
+      # main path: build, scan the built image, then push. Scan-then-push means an
+      # image that fails the gate never exists in the registry to be deployed by
+      # mistake.
+      - name: build (main / dispatch)
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image_uri }}:git-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+      - name: vulnerability scan (main / dispatch)
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}:git-${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # Findings land in the Security tab so they are tracked over time rather
+      # than scrolled past in a log.
+      - name: upload scan results
+        if: always() && github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-backend
+
+      # Push the exact local image that Trivy scanned. Running build-push-action a
+      # second time here would make the shipped image a different build output.
+      - name: push scanned image to ECR
+        if: github.event_name != 'pull_request'
+        id: push
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image_uri }}:git-${{ github.sha }}"
+          docker push "${IMAGE}"
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${{ steps.meta.outputs.repository }}" \
+            --image-ids imageTag=git-${{ github.sha }} \
+            --query 'imageDetails[0].imageDigest' --output text)
+          case "${DIGEST}" in
+            sha256:*) ;;
+            *) echo "::error::ECR returned invalid digest '${DIGEST}'"; exit 1 ;;
+          esac
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # The CodeDeploy revision is a small bundle: lifecycle hook scripts plus the
+      # digest to run. The application itself is in ECR, so the bundle stays a few
+      # KB and every environment deploys byte-identical instructions.
+      - name: package deployment revision
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p revision/scripts
+          cp deploy/appspec.yml deploy/app.service revision/
+          cp deploy/scripts/*.sh revision/scripts/
+          chmod +x revision/scripts/*.sh
+          cat > revision/release.env <<EOF
+          IMAGE_URI=${{ steps.meta.outputs.image_uri }}@${{ steps.push.outputs.digest }}
+          GIT_SHA=${{ github.sha }}
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          (cd revision && zip -qr "../backend-${{ github.sha }}.zip" .)
+
+      - name: upload revision to S3
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          aws s3api put-object \
+            --bucket "${{ vars.ARTIFACT_BUCKET }}" \
+            --key "backend/${{ github.sha }}.zip" \
+            --body "backend-${{ github.sha }}.zip" \
+            --if-none-match '*' > /dev/null
+
+  # ---------------------------------------------------------------------------
+  # Dev — dispatch only, any branch, no approval.
+  #
+  # A dead end on purpose: nothing is ever promoted out of dev. What it proves is
+  # that the change survives the *real* deployment mechanism (CodeDeploy, the same
+  # lifecycle hooks, the same image) rather than only surviving a test runner.
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: deploy dev
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: dev
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: backend-deploy-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-dev-${{ github.run_id }}
+
+      - name: create CodeDeploy deployment
+        id: deploy
+        env:
+          DEV_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name backend-dev \
+            --deployment-config-name CodeDeployDefault.AllAtOnce \
+            --description "dev deploy of ${DEV_REF} by ${GITHUB_ACTOR}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=backend/${{ github.sha }}.zip,bundleType=zip \
+            --query deploymentId --output text)
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          # AllAtOnce: dev is one instance, so OneAtATime would be a slower way of
+          # doing exactly the same thing while pretending to be a canary.
+          aws deploy wait deployment-successful --deployment-id "${DEPLOYMENT_ID}"
+
+      - name: health check
+        env:
+          DEV_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 5 --retry 5 --retry-delay 3 --retry-connrefused \
+            "${{ vars.BACKEND_URL }}/ready" > /dev/null
+          echo "::notice::dev is running ${DEV_REF} (${GITHUB_SHA})"
+
+  # ---------------------------------------------------------------------------
+  # Staging. Automatic, no approval. This is where a bad build is supposed to be
+  # caught, so it must be cheap enough that nobody is tempted to skip it.
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: deploy staging
+    if: github.event_name == 'push'
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: backend-deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-staging-${{ github.run_id }}
+
+      - name: create CodeDeploy deployment
+        id: deploy
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name backend-staging \
+            --deployment-config-name CodeDeployDefault.OneAtATime \
+            --description "gha run ${{ github.run_id }} sha ${{ github.sha }}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=backend/${{ github.sha }}.zip,bundleType=zip \
+            --query deploymentId --output text)
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "::notice::CodeDeploy deployment ${DEPLOYMENT_ID}"
+
+      # `deployment-successful` polls until terminal state. If the deployment
+      # fails, CodeDeploy has already rolled the fleet back to the last known-good
+      # revision before this command returns non-zero.
+      - name: wait for deployment
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id ${{ steps.deploy.outputs.deployment_id }}
+
+      - name: deployment diagnostics on failure
+        if: failure()
+        run: |
+          aws deploy get-deployment \
+            --deployment-id ${{ steps.deploy.outputs.deployment_id }} \
+            --query 'deploymentInfo.{status:status,error:errorInformation,rollback:rollbackInfo}'
+          aws deploy list-deployment-targets \
+            --deployment-id ${{ steps.deploy.outputs.deployment_id }} \
+            --query 'targetIds' --output text | tr '\t' '\n' | while read -r target; do
+              aws deploy get-deployment-target \
+                --deployment-id ${{ steps.deploy.outputs.deployment_id }} \
+                --target-id "$target" \
+                --query 'deploymentTarget.instanceTarget.lifecycleEvents[?status!=`Succeeded`]'
+            done
+
+  # ---------------------------------------------------------------------------
+  # Smoke tests: does the deployed thing actually work, from outside?
+  #
+  # Deliberately not the integration suite. This asks a handful of questions the
+  # unit and integration tests structurally cannot answer: is the load balancer
+  # routing, did the config land, can it reach its own database.
+  # ---------------------------------------------------------------------------
+  smoke-staging:
+    name: smoke test staging
+    if: github.event_name == 'push'
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+      url: ${{ vars.BACKEND_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+        working-directory: backend
+
+      - name: health and readiness
+        env:
+          BASE_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          set -euo pipefail
+
+          # /health is liveness (process is up). /ready is readiness (dependencies
+          # reachable). Checking only /health passes a deploy that cannot talk to
+          # its database.
+          curl -fsS --max-time 5 --retry 5 --retry-delay 3 --retry-connrefused \
+            "${BASE_URL}/health" > /dev/null
+          curl -fsS --max-time 5 "${BASE_URL}/ready" > /dev/null
+
+          # Confirm the running commit is the one we just deployed. Without this,
+          # a deployment that silently no-ops still reports green.
+          DEPLOYED_SHA=$(curl -fsS --max-time 5 "${BASE_URL}/version" | jq -r .git_sha)
+          if [ "${DEPLOYED_SHA}" != "${{ github.sha }}" ]; then
+            echo "::error::staging reports ${DEPLOYED_SHA}, expected ${{ github.sha }}"
+            exit 1
+          fi
+
+      - name: contract smoke
+        env:
+          BASE_URL: ${{ vars.BACKEND_URL }}
+        run: npm run test:smoke
+        working-directory: backend
+
+  # ---------------------------------------------------------------------------
+  # Production.
+  #
+  # `environment: production` is the gate. The required-reviewer rule is
+  # configured on the environment, not here — so it cannot be bypassed by editing
+  # this file in the same PR that ships the change.
+  #
+  # The production IAM role's trust policy only accepts a token whose `sub` is
+  # `...:environment:production`, so approval is not merely advisory: without it,
+  # no credential capable of touching prod can be minted at all.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: deploy production
+    if: github.event_name == 'push'
+    needs: [build, deploy-staging, smoke-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: production
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: backend-deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-prod-${{ github.run_id }}
+
+      # Record what production is running right now, before we change it. This is
+      # the rollback target, captured at the only moment it is knowable for
+      # certain.
+      - name: capture current revision
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT=$(aws deploy list-deployments \
+            --application-name backend \
+            --deployment-group-name backend-production \
+            --include-only-statuses Succeeded \
+            --query 'deployments[0]' --output text)
+          if [ "${CURRENT}" = "None" ]; then
+            echo "key=" >> "$GITHUB_OUTPUT"
+            echo "::warning::first production deployment has no automatic rollback target"
+          else
+            CURRENT_KEY=$(aws deploy get-deployment --deployment-id "${CURRENT}" \
+              --query 'deploymentInfo.revision.s3Location.key' --output text)
+            echo "key=${CURRENT_KEY}" >> "$GITHUB_OUTPUT"
+            echo "::notice::rollback target is ${CURRENT_KEY}"
+          fi
+
+      # OneAtATime + the AfterAllowTraffic hook is the canary. The hook holds the
+      # first instance in progress for a bake window after ALB registration, so the
+      # deployment stops on instance 1 of N rather than after all N are broken.
+      - name: create CodeDeploy deployment
+        id: deploy
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name backend-production \
+            --deployment-config-name CodeDeployDefault.OneAtATime \
+            --description "gha run ${{ github.run_id }} sha ${{ github.sha }}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=backend/${{ github.sha }}.zip,bundleType=zip \
+            --query deploymentId --output text)
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "::notice::CodeDeploy deployment ${DEPLOYMENT_ID}"
+
+      - name: wait for deployment
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id ${{ steps.deploy.outputs.deployment_id }}
+
+      # Post-deployment bake. CodeDeploy's own alarm-based rollback stops watching
+      # once the deployment reaches Succeeded; most regressions (memory leak,
+      # slow query under real traffic, a poisoned cache) show up in the minutes
+      # after that. This step keeps watching.
+      - name: bake and watch alarms
+        id: bake
+        run: |
+          set -euo pipefail
+          BAKE_SECONDS=600
+          DEADLINE=$(( $(date +%s) + BAKE_SECONDS ))
+          ALARMS="backend-production-5xx backend-production-p99-latency"
+
+          while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+            STATE=$(aws cloudwatch describe-alarms \
+              --alarm-names ${ALARMS} \
+              --state-value ALARM \
+              --query 'MetricAlarms[].AlarmName' --output text)
+            if [ -n "${STATE}" ]; then
+              echo "::error::alarm(s) in ALARM during bake: ${STATE}"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::notice::bake window clean"
+
+      # Automatic rollback for the window CodeDeploy no longer covers. Redeploying
+      # the previous revision is safe because that revision is immutable and was
+      # itself verified when it shipped.
+      - name: roll back on bake failure
+        if: >-
+          failure() &&
+          steps.bake.outcome == 'failure' &&
+          steps.current.outputs.key != ''
+        run: |
+          set -euo pipefail
+          echo "::warning::rolling back to ${{ steps.current.outputs.key }}"
+          ROLLBACK_ID=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name backend-production \
+            --deployment-config-name CodeDeployDefault.AllAtOnce \
+            --description "auto-rollback from failed bake, run ${{ github.run_id }}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=${{ steps.current.outputs.key }},bundleType=zip \
+            --query deploymentId --output text)
+          # AllAtOnce here is deliberate: the fleet is already known-bad, so
+          # restoring every instance quickly beats restoring them politely.
+          aws deploy wait deployment-successful --deployment-id "${ROLLBACK_ID}"
+          echo "::notice::rolled back via ${ROLLBACK_ID}"

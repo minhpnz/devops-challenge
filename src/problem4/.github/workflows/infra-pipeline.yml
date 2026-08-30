@@ -1,0 +1,399 @@
+# Infrastructure pipeline — Terraform for everything the delivery pipelines need
+# in order to exist and to be safe.
+#
+# Pull requests get advisory plans for review. After merge each environment runs
+# an ungated preview followed by a gated apply, so the person approving the
+# apply is approving a change set they can actually see, and the apply refuses to
+# run if that change set has moved underneath them.
+name: infra
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/infra-pipeline.yml"
+      - ".github/actions/terraform-plan/**"
+      - ".github/actions/terraform-apply/**"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/infra-pipeline.yml"
+      - ".github/actions/terraform-plan/**"
+      - ".github/actions/terraform-apply/**"
+
+# Never two Terraform runs against the same state at once. The S3 backend's lock
+# would reject the second one anyway; failing here is faster and clearer.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validation and security scanning of the configuration itself. No credentials.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: format check
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+
+      # Validate every root module. -backend=false because validation does not
+      # need (and must not have) state access — this job holds no credentials, so
+      # it can safely run on fork pull requests.
+      - name: validate roots
+        run: |
+          set -euo pipefail
+          for root in terraform/env/*/; do
+            echo "::group::validate ${root}"
+            terraform -chdir="${root}" init -backend=false -input=false
+            terraform -chdir="${root}" validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --recursive
+        working-directory: terraform
+
+      # Catches the misconfigurations that IAM will happily let you create:
+      # public buckets, unencrypted volumes, wide-open security groups, wildcard
+      # IAM actions.
+      - name: security scan (checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: false
+
+      - name: upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-terraform
+
+  # ---------------------------------------------------------------------------
+  # Plan for every environment on internal PRs, posted as a comment.
+  #
+  # The plan role is read-only. Fork PRs are deliberately excluded because
+  # GitHub does not expose repository variables or issue OIDC tokens to them.
+  # ---------------------------------------------------------------------------
+  plan-pr:
+    name: plan (${{ matrix.environment }})
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # One root module per environment, each with its own state. `shared` holds
+        # the account-level pieces (OIDC provider, ECR, artifact bucket) that the
+        # others read but must never own.
+        environment: [shared, dev, staging, production]
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-plan-${{ github.run_id }}
+
+      # No -backend-config and no -var-file: the backend key and every
+      # environment-specific value are literals inside the root module. There is
+      # therefore no flag that could point production's values at staging's
+      # state — a class of mistake that is silent until someone notices the wrong
+      # thing was deployed.
+      - name: init
+        run: terraform init -input=false -lock-timeout=5m
+        working-directory: terraform/env/${{ matrix.environment }}
+
+      - name: plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -lock-timeout=5m -no-color \
+            -out="tfplan" -detailed-exitcode 2>&1 | tee plan.txt || EXIT=$?
+          # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error.
+          # Treating 2 as success is the point; treating 1 as success would let a
+          # broken plan through.
+          if [ "${EXIT:-0}" = "1" ]; then exit 1; fi
+          echo "changes=${EXIT:-0}" >> "$GITHUB_OUTPUT"
+        working-directory: terraform/env/${{ matrix.environment }}
+
+      - name: comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync(`terraform/env/${process.env.ENVIRONMENT}/plan.txt`, 'utf8');
+            // GitHub comments cap at 65,536 characters; keep the tail, which is
+            // where the summary line lives.
+            const LIMIT = 60000;
+            if (plan.length > LIMIT) {
+              plan = '...(truncated, see the job log for the full plan)...\n' + plan.slice(-LIMIT);
+            }
+            const marker = `<!-- tfplan:${process.env.ENVIRONMENT} -->`;
+            const body = `${marker}\n### Terraform plan — \`${process.env.ENVIRONMENT}\`\n\n<details><summary>show plan</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n\n</details>`;
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number,
+            });
+            // Update in place rather than appending: a PR with nine plan comments
+            // is a PR where nobody reads the plan.
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+  # ---------------------------------------------------------------------------
+  # Apply — main only, explicitly ordered, and reviewed as preview/apply pairs.
+  #
+  # Each environment gets two jobs:
+  #
+  #   preview-<env>   ungated, read-only role. Plans against the state as it is
+  #                   *after* the preceding environment applied, and publishes
+  #                   the change set plus a fingerprint of it.
+  #   apply-<env>     gated by the <env>-infra environment. Re-plans, checks its
+  #                   change set against the fingerprint the approver saw, and
+  #                   aborts on a mismatch.
+  #
+  # Why the pair, rather than planning inside the gated job: a GitHub Environment
+  # gate is evaluated before the job starts, so anything the job computes is
+  # invisible to the person approving it. Without the preview they would be
+  # approving a commit, not a change — which is not the same promise, and is
+  # weaker exactly where it matters most.
+  #
+  # Why not simply apply the PR's plan: it was produced against older state, and
+  # for dev/staging/production it was produced before `shared` applied, so it can
+  # be stale in two different ways. The preview is regenerated in-run instead.
+  # ---------------------------------------------------------------------------
+  preview-shared:
+    name: preview (shared)
+    if: github.event_name == 'push'
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      fingerprint: ${{ steps.preview.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-plan
+        id: preview
+        with:
+          environment: shared
+          role-arn: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+  apply-shared:
+    name: apply (shared)
+    if: github.event_name == 'push'
+    needs: [preview-shared]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: shared-infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: shared
+          role-arn: ${{ vars.TERRAFORM_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+          expected-fingerprint: ${{ needs.preview-shared.outputs.fingerprint }}
+
+  preview-dev:
+    name: preview (dev)
+    if: github.event_name == 'push'
+    needs: [apply-shared]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      fingerprint: ${{ steps.preview.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-plan
+        id: preview
+        with:
+          environment: dev
+          role-arn: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+  apply-dev:
+    name: apply (dev)
+    if: github.event_name == 'push'
+    needs: [preview-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: dev-infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: dev
+          role-arn: ${{ vars.TERRAFORM_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+          expected-fingerprint: ${{ needs.preview-dev.outputs.fingerprint }}
+
+  preview-staging:
+    name: preview (staging)
+    if: github.event_name == 'push'
+    needs: [apply-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      fingerprint: ${{ steps.preview.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-plan
+        id: preview
+        with:
+          environment: staging
+          role-arn: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+  apply-staging:
+    name: apply (staging)
+    if: github.event_name == 'push'
+    needs: [preview-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging-infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: staging
+          role-arn: ${{ vars.TERRAFORM_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+          expected-fingerprint: ${{ needs.preview-staging.outputs.fingerprint }}
+
+  preview-production:
+    name: preview (production)
+    if: github.event_name == 'push'
+    needs: [apply-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      fingerprint: ${{ steps.preview.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-plan
+        id: preview
+        with:
+          environment: production
+          role-arn: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+  apply-production:
+    name: apply (production)
+    if: github.event_name == 'push'
+    needs: [preview-production]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production-infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: production
+          role-arn: ${{ vars.TERRAFORM_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          terraform-version: ${{ env.TF_VERSION }}
+          expected-fingerprint: ${{ needs.preview-production.outputs.fingerprint }}

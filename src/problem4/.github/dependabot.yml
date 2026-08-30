@@ -1,0 +1,56 @@
+# Supply-chain maintenance for the pipeline itself.
+#
+# A third-party action runs with the job's permissions and, in the deploy jobs,
+# alongside AWS credentials. Pinning actions to a commit SHA is the control that
+# makes a compromised upstream tag a non-event; Dependabot is what keeps those
+# pins from rotting into a year-old version with a known CVE.
+#
+# Pin-and-update is one mechanism, not two: pinning without updating is how a
+# repository ends up on actions/checkout@v3 in 2026.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Actions are updated in one PR rather than eight. Reviewing a workflow change
+    # is cheap; reviewing eight separate ones is what makes people rubber-stamp.
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "infra"]
+
+  - package-ecosystem: npm
+    directory: /backend
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor bumps land together and are usually safe to merge on a
+      # green pipeline. Majors come in their own PR because they need a human to
+      # read a changelog.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "backend"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "frontend"]
+
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "backend"]

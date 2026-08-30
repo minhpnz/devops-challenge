@@ -1,0 +1,46 @@
+# CodeDeploy revision spec for the backend.
+#
+# The revision is a few KB: hook scripts plus release.env (which carries the image
+# digest). The application itself lives in ECR. That keeps the artifact in S3
+# small, and — more importantly — means the thing being deployed is referenced by
+# digest, so the same revision can never resolve to two different images.
+version: 0.0
+os: linux
+
+files:
+  - source: /
+    destination: /opt/app/release
+
+hooks:
+  # Deregistration from the ALB and connection draining are handled by CodeDeploy
+  # itself via the deployment group's load balancer configuration, not here.
+
+  ApplicationStop:
+    # Runs from the PREVIOUS revision, not this one. A change to this script only
+    # takes effect on the deployment after the one that introduces it.
+    - location: scripts/stop_service.sh
+      timeout: 60
+      runas: root
+
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 300
+      runas: root
+
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 600 # image pull over a cold NAT gateway can be slow
+      runas: root
+
+  ApplicationStart:
+    - location: scripts/start_service.sh
+      timeout: 180
+      runas: root
+
+  AfterAllowTraffic:
+    # This is the canary gate. The instance has been registered with the ALB, so
+    # the script can validate target health and observe real traffic. With
+    # OneAtATime, CodeDeploy does not continue to instance 2 until this returns 0.
+    - location: scripts/validate_service.sh
+      timeout: 600
+      runas: root

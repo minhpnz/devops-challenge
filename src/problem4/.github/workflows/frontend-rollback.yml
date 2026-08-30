@@ -1,0 +1,125 @@
+# Manual rollback for the frontend.
+#
+# Cheaper than the backend's: every release was archived under
+# s3://<bucket>/releases/<sha>/ at publish time, so rolling back is a copy plus
+# an invalidation. No rebuild — which matters, because rebuilding a three-week-old
+# commit often fails on dependencies that have since moved.
+name: frontend rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        type: choice
+        options: [staging, production]
+        # dev is absent on purpose: redeploying any branch to dev takes two minutes
+        # and is the rollback. A rollback workflow for it would be ceremony.
+        default: production
+        required: true
+      sha:
+        description: Commit SHA of the release to restore (must exist under releases/)
+        type: string
+        required: true
+      reason:
+        description: Why (recorded in the run summary and the audit trail)
+        type: string
+        required: true
+
+concurrency:
+  group: frontend-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+
+jobs:
+  rollback:
+    name: roll back ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-fe-rollback-${{ github.run_id }}
+
+      - name: resolve bucket and distribution
+        id: env
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::sha must be a full 40-character lowercase commit SHA"; exit 1; }
+          echo "bucket=${{ vars.FRONTEND_BUCKET }}" >> "$GITHUB_OUTPUT"
+          echo "distribution=${{ vars.CLOUDFRONT_ID }}" >> "$GITHUB_OUTPUT"
+          echo "url=${{ vars.FRONTEND_URL }}" >> "$GITHUB_OUTPUT"
+          echo "api=${{ vars.BACKEND_URL }}" >> "$GITHUB_OUTPUT"
+
+      # Fail fast on a SHA that was never released, before touching live objects.
+      - name: fetch archived release
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          PREFIX="s3://${{ steps.env.outputs.bucket }}/releases/${TARGET_SHA}/"
+          aws s3 ls "${PREFIX}" > /dev/null \
+            || { echo "::error::no archived release at ${PREFIX}"; exit 1; }
+          aws s3 sync "${PREFIX}" dist/ --only-show-errors
+          test -f dist/index.html \
+            || { echo "::error::archived release has no index.html"; exit 1; }
+
+      # Reuse the forward-path publisher: same ordering guarantees, same cache
+      # headers. A rollback that publishes differently from a deploy is a second
+      # code path that only ever executes during an incident — the worst possible
+      # time to discover it is wrong.
+      - name: publish archived release
+        uses: ./.github/actions/publish-spa
+        with:
+          bucket: ${{ steps.env.outputs.bucket }}
+          distribution-id: ${{ steps.env.outputs.distribution }}
+          api-base-url: ${{ steps.env.outputs.api }}
+          environment: ${{ inputs.environment }}
+          git-sha: ${{ inputs.sha }}
+
+      - name: verify
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          DEPLOYED=$(curl -fsS --max-time 10 "${{ steps.env.outputs.url }}/config.json" | jq -r .gitSha)
+          [ "${DEPLOYED}" = "${TARGET_SHA}" ] || {
+            echo "::error::serving ${DEPLOYED}, expected ${TARGET_SHA}"; exit 1; }
+          echo "::notice::${{ inputs.environment }} restored to ${TARGET_SHA}"
+
+      - name: summary
+        if: always()
+        env:
+          ROLLBACK_REASON: ${{ inputs.reason }}
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          {
+            echo "### Frontend rollback — ${{ inputs.environment }}"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| restored | \`${TARGET_SHA}\` |"
+            echo "| actor | @${{ github.actor }} |"
+            echo "| reason | ${ROLLBACK_REASON} |"
+            echo "| result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

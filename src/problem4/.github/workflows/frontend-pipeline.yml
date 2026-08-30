@@ -1,0 +1,371 @@
+# Frontend delivery pipeline — static SPA on S3, served through CloudFront.
+#
+# Two invariants this file exists to protect:
+#
+#   1. The bundle uploaded to production is byte-identical to the bundle that was
+#      tested in staging. That forces environment configuration to be *fetched at
+#      runtime* (/config.json) rather than baked in at build time. If the API URL
+#      were compiled into the bundle, "promoting" would mean rebuilding, and the
+#      thing you tested would not be the thing you shipped.
+#
+#   2. Hashed assets are published BEFORE index.html, and index.html is
+#      invalidated AFTER them. Reverse that order and users fetch a new
+#      index.html that references assets which do not exist yet — a white screen
+#      lasting exactly as long as the sync takes.
+name: frontend
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-pipeline.yml"
+      - ".github/actions/publish-spa/**"
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-pipeline.yml"
+      - ".github/actions/publish-spa/**"
+  # Publish the dispatched ref to dev. Input-free: what ships is the branch the
+  # run was launched from.
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  # Gzipped budget for the initial JS payload. A number, in the pipeline, that
+  # fails the build — otherwise bundle size only ever goes one direction.
+  JS_BUDGET_KB: 250
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Quality gate. Runs on PRs and on main; on main it also produces the single
+  # artifact that both environments will receive.
+  # ---------------------------------------------------------------------------
+  build:
+    name: test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+        working-directory: frontend
+
+      - name: lint
+        run: npm run lint
+        working-directory: frontend
+
+      - name: typecheck
+        run: npm run typecheck
+        working-directory: frontend
+
+      - name: unit tests
+        run: npm run test -- --run --reporter=default --reporter=junit --outputFile=reports/unit.xml
+        working-directory: frontend
+
+      - name: publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: frontend/reports/unit.xml
+          check_name: frontend tests
+
+      # A dependency audit that fails only on high/critical. Failing on `low`
+      # turns the gate into noise and the team stops reading it.
+      - name: dependency audit
+        run: npm audit --audit-level=high
+        working-directory: frontend
+
+      - name: secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # No environment variables here beyond NODE_ENV. If a build needs to know
+      # which environment it is for, invariant 1 is already broken.
+      - name: build
+        run: npm run build
+        working-directory: frontend
+        env:
+          NODE_ENV: production
+
+      - name: bundle size budget
+        run: |
+          set -euo pipefail
+          TOTAL=$(find dist/assets -name '*.js' -exec gzip -c {} \; | wc -c)
+          TOTAL_KB=$(( TOTAL / 1024 ))
+          echo "gzipped JS: ${TOTAL_KB} KB (budget ${JS_BUDGET_KB} KB)"
+          echo "| gzipped JS | ${TOTAL_KB} KB / ${JS_BUDGET_KB} KB budget |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${TOTAL_KB}" -gt "${JS_BUDGET_KB}" ]; then
+            echo "::error::bundle over budget: ${TOTAL_KB} KB > ${JS_BUDGET_KB} KB"
+            exit 1
+          fi
+        working-directory: frontend
+
+      # index.html must never be cached at the edge or in the browser; every other
+      # file is content-hashed by the bundler and therefore cacheable forever.
+      # Fail loudly if the bundler stops emitting hashed filenames — that would
+      # silently turn the immutable cache header below into a correctness bug.
+      - name: verify assets are content-hashed
+        run: |
+          set -euo pipefail
+          UNHASHED=$(find dist/assets -type f \
+            \( -name '*.js' -o -name '*.css' \) \
+            ! -regex '.*-[A-Za-z0-9_]\{8,\}\.\(js\|css\)' || true)
+          if [ -n "${UNHASHED}" ]; then
+            echo "::error::assets without a content hash would be served immutable:"
+            echo "${UNHASHED}"
+            exit 1
+          fi
+        working-directory: frontend
+
+      - name: upload bundle
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: frontend/dist/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Dev — dispatch only. Same publish action as staging and production, so the
+  # ordering guarantees are exercised on every dev push rather than only twice a
+  # week on the promotion path.
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: deploy dev
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: dev
+      url: ${{ vars.FRONTEND_URL }}
+    concurrency:
+      group: frontend-deploy-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: dist
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-fe-dev-${{ github.run_id }}
+
+      - name: publish
+        uses: ./.github/actions/publish-spa
+        with:
+          bucket: ${{ vars.FRONTEND_BUCKET }}
+          distribution-id: ${{ vars.CLOUDFRONT_ID }}
+          api-base-url: ${{ vars.BACKEND_URL }}
+          environment: dev
+          git-sha: ${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # Staging.
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: deploy staging
+    if: github.event_name == 'push'
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: ${{ vars.FRONTEND_URL }}
+    concurrency:
+      group: frontend-deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: dist
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-fe-staging-${{ github.run_id }}
+
+      - name: publish
+        uses: ./.github/actions/publish-spa
+        with:
+          bucket: ${{ vars.FRONTEND_BUCKET }}
+          distribution-id: ${{ vars.CLOUDFRONT_ID }}
+          api-base-url: ${{ vars.BACKEND_URL }}
+          environment: staging
+          git-sha: ${{ github.sha }}
+
+      - name: smoke test
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL }}
+          BUCKET: ${{ vars.FRONTEND_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          # The SPA shell must load and must not be cached at the edge.
+          CC=$(curl -fsSI --max-time 10 "${BASE_URL}/index.html" \
+            | tr -d '\r' | awk 'tolower($1)=="cache-control:"{$1=""; print}' | xargs)
+          case "${CC}" in
+            *no-cache*) ;;
+            *) echo "::error::index.html Cache-Control is '${CC}', expected no-cache"; exit 1 ;;
+          esac
+
+          # The deployed build must be the one we just published.
+          DEPLOYED=$(curl -fsS --max-time 10 "${BASE_URL}/config.json" | jq -r .gitSha)
+          [ "${DEPLOYED}" = "${{ github.sha }}" ] || {
+            echo "::error::staging serving ${DEPLOYED}, expected ${{ github.sha }}"; exit 1; }
+
+          # Every asset referenced by index.html must actually resolve. This is the
+          # check that catches the publish-order bug described at the top of this file.
+          grep -oE '(src|href)="/assets/[^"]+"' dist/index.html \
+            | sed -E 's/.*"(\/assets\/[^"]+)"/\1/' | sort -u | while read -r path; do
+              aws s3api head-object --bucket "${BUCKET}" --key "${path#/}" > /dev/null \
+                || { echo "::error::missing origin object ${path}"; exit 1; }
+              CONTENT_TYPE=$(curl -fsSI --max-time 10 "${BASE_URL}${path}" \
+                | tr -d '\r' | awk 'tolower($1)=="content-type:"{$1=""; print}' | xargs)
+              case "${CONTENT_TYPE}" in
+                text/html*) echo "::error::${path} resolved to the SPA fallback"; exit 1 ;;
+              esac
+              curl -fsS --max-time 10 -o /dev/null "${BASE_URL}${path}" \
+                || { echo "::error::missing asset ${path}"; exit 1; }
+            done
+
+  # ---------------------------------------------------------------------------
+  # Production — same artifact, same action, different bucket and config.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: deploy production
+    if: github.event_name == 'push'
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.FRONTEND_URL }}
+    concurrency:
+      group: frontend-deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The same artifact object that staging received. Not a rebuild.
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: dist
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-fe-prod-${{ github.run_id }}
+
+      - name: capture current production release
+        id: previous
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL }}
+          BUCKET: ${{ vars.FRONTEND_BUCKET }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(curl -fsS --max-time 10 "${BASE_URL}/config.json" 2>/dev/null \
+            | jq -r .gitSha 2>/dev/null || true)
+          if [[ "${CURRENT}" =~ ^[0-9a-f]{40}$ ]] \
+            && aws s3api head-object --bucket "${BUCKET}" \
+              --key "releases/${CURRENT}/index.html" > /dev/null 2>&1; then
+            aws s3 sync "s3://${BUCKET}/releases/${CURRENT}/" rollback-dist/ --only-show-errors
+            echo "sha=${CURRENT}" >> "$GITHUB_OUTPUT"
+            echo "::notice::automatic rollback target is ${CURRENT}"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "::warning::no archived production release is available for automatic rollback"
+          fi
+
+      - name: publish
+        uses: ./.github/actions/publish-spa
+        with:
+          bucket: ${{ vars.FRONTEND_BUCKET }}
+          distribution-id: ${{ vars.CLOUDFRONT_ID }}
+          api-base-url: ${{ vars.BACKEND_URL }}
+          environment: production
+          git-sha: ${{ github.sha }}
+
+      - name: smoke test
+        env:
+          BASE_URL: ${{ vars.FRONTEND_URL }}
+          BUCKET: ${{ vars.FRONTEND_BUCKET }}
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 10 -o /dev/null "${BASE_URL}/index.html"
+          DEPLOYED=$(curl -fsS --max-time 10 "${BASE_URL}/config.json" | jq -r .gitSha)
+          [ "${DEPLOYED}" = "${{ github.sha }}" ] || {
+            echo "::error::production serving ${DEPLOYED}, expected ${{ github.sha }}"; exit 1; }
+          grep -oE '(src|href)="/assets/[^"]+"' dist/index.html \
+            | sed -E 's/.*"(\/assets\/[^"]+)"/\1/' | sort -u | while read -r path; do
+              aws s3api head-object --bucket "${BUCKET}" --key "${path#/}" > /dev/null \
+                || { echo "::error::missing origin object ${path}"; exit 1; }
+              CONTENT_TYPE=$(curl -fsSI --max-time 10 "${BASE_URL}${path}" \
+                | tr -d '\r' | awk 'tolower($1)=="content-type:"{$1=""; print}' | xargs)
+              case "${CONTENT_TYPE}" in
+                text/html*) echo "::error::${path} resolved to the SPA fallback"; exit 1 ;;
+              esac
+              curl -fsS --max-time 10 -o /dev/null "${BASE_URL}${path}" \
+                || { echo "::error::missing asset ${path}"; exit 1; }
+            done
+
+      - name: restore previous production release on failure
+        if: failure() && steps.previous.outputs.sha != ''
+        uses: ./.github/actions/publish-spa
+        with:
+          bucket: ${{ vars.FRONTEND_BUCKET }}
+          distribution-id: ${{ vars.CLOUDFRONT_ID }}
+          api-base-url: ${{ vars.BACKEND_URL }}
+          environment: production
+          git-sha: ${{ steps.previous.outputs.sha }}
+          dist-path: rollback-dist

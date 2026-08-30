@@ -1,0 +1,174 @@
+# Publish a built SPA to S3 + CloudFront, in the only order that is safe.
+#
+# Extracted as a composite action because it is used three times (staging,
+# production, rollback) and the *order of its steps is the correctness property*.
+# Copy-pasting it into three workflows guarantees that one day someone edits two
+# of the three.
+name: publish SPA
+description: Publish a built SPA bundle to S3 and invalidate CloudFront, assets first.
+
+inputs:
+  bucket:
+    description: Target S3 bucket name
+    required: true
+  distribution-id:
+    description: CloudFront distribution ID
+    required: true
+  api-base-url:
+    description: API base URL written into the runtime config
+    required: true
+  environment:
+    description: Environment name (dev | staging | production)
+    required: true
+  git-sha:
+    description: Commit being published
+    required: true
+  dist-path:
+    description: Directory containing the built bundle
+    required: false
+    default: dist
+
+runs:
+  using: composite
+  steps:
+    - name: validate publish inputs
+      shell: bash
+      env:
+        DEPLOY_ENV: ${{ inputs.environment }}
+        DIST_PATH: ${{ inputs.dist-path }}
+        GIT_SHA: ${{ inputs.git-sha }}
+        API_BASE_URL: ${{ inputs.api-base-url }}
+      run: |
+        set -euo pipefail
+        [[ "${GIT_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+          || { echo "::error::git-sha must be a full lowercase commit SHA"; exit 1; }
+        case "${DEPLOY_ENV}" in dev|staging|production) ;; *) exit 1 ;; esac
+        [[ "${API_BASE_URL}" =~ ^https://[^/]+$ ]] \
+          || { echo "::error::api-base-url must be an HTTPS origin"; exit 1; }
+        test -f "${DIST_PATH}/index.html" \
+          || { echo "::error::${DIST_PATH}/index.html does not exist"; exit 1; }
+
+    # Runtime configuration. This is what lets one bundle serve every
+    # environment: the JS boots, fetches /config.json, and only then knows which
+    # API to call. gitSha doubles as the deployment marker the smoke tests assert
+    # on.
+    - name: write runtime config
+      shell: bash
+      env:
+        API_BASE_URL: ${{ inputs.api-base-url }}
+        DEPLOY_ENV: ${{ inputs.environment }}
+        DIST_PATH: ${{ inputs.dist-path }}
+        GIT_SHA: ${{ inputs.git-sha }}
+      run: |
+        set -euo pipefail
+        jq -n \
+          --arg apiBaseUrl "${API_BASE_URL}" \
+          --arg environment "${DEPLOY_ENV}" \
+          --arg gitSha "${GIT_SHA}" \
+          '{apiBaseUrl: $apiBaseUrl, environment: $environment, gitSha: $gitSha}' \
+          > "${DIST_PATH}/config.json"
+
+    # Keep an immutable copy of every release. Rollback then costs one copy
+    # operation instead of a rebuild of an old commit whose dependencies may no
+    # longer resolve.
+    - name: archive release
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        DIST_PATH: ${{ inputs.dist-path }}
+        GIT_SHA: ${{ inputs.git-sha }}
+      run: |
+        set -euo pipefail
+        aws s3 sync "${DIST_PATH}/" \
+          "s3://${BUCKET}/releases/${GIT_SHA}/" \
+          --only-show-errors
+
+    # STEP 1 of the ordered publish: content-hashed assets, cached forever.
+    # Safe to publish early precisely because their names are content-addressed —
+    # no live page references them yet, and no stale page ever will.
+    - name: publish hashed assets
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        DIST_PATH: ${{ inputs.dist-path }}
+      run: |
+        set -euo pipefail
+        aws s3 sync "${DIST_PATH}/" "s3://${BUCKET}/" \
+          --exclude "index.html" \
+          --exclude "config.json" \
+          --exclude "releases/*" \
+          --cache-control "public,max-age=31536000,immutable" \
+          --only-show-errors
+
+    # STEP 2: the entry points, uncacheable. The moment index.html lands, users
+    # start getting the new build — and every asset it references is already
+    # in place.
+    #
+    # No --delete anywhere in this action: old hashed assets stay so that a
+    # browser mid-session (or a rollback five minutes from now) can still fetch
+    # what it was told to fetch. V1 keeps them; cleanup must be manifest-aware so
+    # it cannot delete assets referenced by the live or archived releases.
+    - name: publish entry points
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        DIST_PATH: ${{ inputs.dist-path }}
+      run: |
+        set -euo pipefail
+        aws s3 cp "${DIST_PATH}/index.html" "s3://${BUCKET}/index.html" \
+          --cache-control "no-cache,must-revalidate" \
+          --content-type "text/html; charset=utf-8" \
+          --only-show-errors
+        aws s3 cp "${DIST_PATH}/config.json" "s3://${BUCKET}/config.json" \
+          --cache-control "no-cache,must-revalidate" \
+          --content-type "application/json" \
+          --only-show-errors
+
+    # STEP 3: invalidate only the two uncacheable paths.
+    #
+    # `/*` would be wrong twice over: it discards edge copies of immutable assets
+    # that have not changed (re-fetch storm against the origin), and only the
+    # first 1,000 invalidation paths per month are free — a wildcard counts as one
+    # path, but the cache damage is the real cost.
+    - name: invalidate CloudFront
+      shell: bash
+      id: invalidate
+      env:
+        DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+      run: |
+        set -euo pipefail
+        ID=$(aws cloudfront create-invalidation \
+          --distribution-id "${DISTRIBUTION_ID}" \
+          --paths "/index.html" "/config.json" \
+          --query 'Invalidation.Id' --output text)
+        echo "id=${ID}" >> "$GITHUB_OUTPUT"
+
+    # Wait for propagation before the caller runs smoke tests, otherwise the smoke
+    # test can pass against the *previous* build still cached at the edge and
+    # report a broken deploy as healthy.
+    - name: wait for invalidation
+      shell: bash
+      env:
+        DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+        INVALIDATION_ID: ${{ steps.invalidate.outputs.id }}
+      run: |
+        set -euo pipefail
+        aws cloudfront wait invalidation-completed \
+          --distribution-id "${DISTRIBUTION_ID}" \
+          --id "${INVALIDATION_ID}"
+
+    - name: summary
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        DEPLOY_ENV: ${{ inputs.environment }}
+        GIT_SHA: ${{ inputs.git-sha }}
+        INVALIDATION_ID: ${{ steps.invalidate.outputs.id }}
+      run: |
+        {
+          echo "### Published \`${GIT_SHA}\` to ${DEPLOY_ENV}"
+          echo ""
+          echo "- bucket: \`${BUCKET}\`"
+          echo "- release archive: \`s3://${BUCKET}/releases/${GIT_SHA}/\`"
+          echo "- invalidation: \`${INVALIDATION_ID}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

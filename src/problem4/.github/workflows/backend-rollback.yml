@@ -1,0 +1,139 @@
+# Manual rollback for the backend.
+#
+# Rollback is a workflow, not a runbook paragraph. At 03:00 the on-call engineer
+# should be picking a commit from a dropdown, not reconstructing an `aws deploy
+# create-deployment` invocation from memory while the error rate climbs.
+#
+# This is deliberately the shortest path in the repository: no build, no tests,
+# no approval on the fast path. The revision being restored already passed every
+# gate when it shipped, so re-running them buys nothing and costs minutes.
+name: backend rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        type: choice
+        options: [staging, production]
+        # dev is absent on purpose: redeploying any branch to dev takes two minutes
+        # and is the rollback. A rollback workflow for it would be ceremony.
+        default: production
+        required: true
+      sha:
+        description: >-
+          Commit SHA to roll back to. Leave empty to use the previous successful
+          deployment.
+        type: string
+        required: false
+      reason:
+        description: Why (goes into the deployment description and the audit trail)
+        type: string
+        required: true
+
+concurrency:
+  # Share the deploy lock with the forward pipeline: a rollback must never race a
+  # deployment into the same environment.
+  group: backend-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+
+jobs:
+  rollback:
+    name: roll back ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Still gated by the environment: the same protection rules apply, so a
+    # rollback to production is auditable and (if the environment requires it)
+    # reviewed. If your team decides speed beats review during an incident,
+    # remove the reviewer rule from the environment — do not remove this line,
+    # because the OIDC trust policy is keyed to it.
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-rollback-${{ github.run_id }}
+
+      - name: resolve target revision
+        id: target
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TARGET_SHA}" ]; then
+            [[ "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "::error::sha must be a full 40-character lowercase commit SHA"; exit 1; }
+            KEY="backend/${TARGET_SHA}.zip"
+            # Verify the revision exists before starting: a typo'd SHA should fail
+            # here in two seconds, not halfway through a fleet-wide deployment.
+            aws s3api head-object \
+              --bucket "${{ vars.ARTIFACT_BUCKET }}" --key "${KEY}" > /dev/null \
+              || { echo "::error::no revision at s3://${{ vars.ARTIFACT_BUCKET }}/${KEY}"; exit 1; }
+          else
+            # index 1, not 0: index 0 is the deployment we are rolling back from.
+            PREV=$(aws deploy list-deployments \
+              --application-name backend \
+              --deployment-group-name backend-${{ inputs.environment }} \
+              --include-only-statuses Succeeded \
+              --query 'deployments[1]' --output text)
+            [ "${PREV}" = "None" ] && { echo "::error::no previous successful deployment"; exit 1; }
+            KEY=$(aws deploy get-deployment --deployment-id "${PREV}" \
+              --query 'deploymentInfo.revision.s3Location.key' --output text)
+          fi
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "::notice::rolling ${{ inputs.environment }} back to ${KEY}"
+
+      - name: deploy previous revision
+        id: deploy
+        env:
+          ROLLBACK_REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          # AllAtOnce: the current state is already known-bad. Rolling one instance
+          # at a time would leave the fleet mixed and the incident open for longer.
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name backend-${{ inputs.environment }} \
+            --deployment-config-name CodeDeployDefault.AllAtOnce \
+            --description "ROLLBACK by ${GITHUB_ACTOR}: ${ROLLBACK_REASON}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=${{ steps.target.outputs.key }},bundleType=zip \
+            --query deploymentId --output text)
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          aws deploy wait deployment-successful --deployment-id "${DEPLOYMENT_ID}"
+
+      - name: verify
+        env:
+          BASE_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 5 --retry 5 --retry-delay 3 "${BASE_URL}/ready" > /dev/null
+          echo "::notice::${{ inputs.environment }} healthy after rollback"
+
+      - name: summary
+        if: always()
+        env:
+          ROLLBACK_REASON: ${{ inputs.reason }}
+        run: |
+          {
+            echo "### Backend rollback — ${{ inputs.environment }}"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| revision | \`${{ steps.target.outputs.key }}\` |"
+            echo "| deployment | \`${{ steps.deploy.outputs.deployment_id }}\` |"
+            echo "| actor | @${{ github.actor }} |"
+            echo "| reason | ${ROLLBACK_REASON} |"
+            echo "| result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

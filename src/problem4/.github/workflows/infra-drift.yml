@@ -1,0 +1,193 @@
+# Scheduled drift detection.
+#
+# Everything in terraform/env is applied from main, so on a healthy day a plan
+# against any root is empty. A non-empty plan means one of three things, and all
+# three are worth knowing about:
+#
+#   - somebody changed infrastructure in the console (usually during an incident,
+#     and usually never written back)
+#   - an apply failed or was skipped and nobody noticed
+#   - a provider upgrade reinterprets existing configuration
+#
+# Without this, the repository's claim to be the source of truth decays quietly,
+# and you find out at the worst possible moment: the next apply, when an
+# unrelated change carries a surprise along with it.
+name: infra drift
+
+on:
+  schedule:
+    # 02:00 UTC = 09:00 in ap-southeast-1. Deliberately in the morning: an issue
+    # filed at 3am is read at 9am anyway, and a drift finding is never so urgent
+    # that it should wake someone.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+# Never contend with the apply pipeline. If a real apply is mid-flight, this run
+# waits rather than reporting the in-progress change as drift.
+concurrency:
+  group: terraform-drift
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  detect:
+    name: drift (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # One environment's drift must not hide another's.
+      fail-fast: false
+      matrix:
+        environment: [shared, dev, staging, production]
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # The read-only plan role. Drift detection must never be able to correct
+      # what it finds: the fix belongs in a reviewed pull request, not in a
+      # cron job that silently reshapes production at 2am.
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-drift-${{ matrix.environment }}-${{ github.run_id }}
+
+      - name: init
+        run: terraform init -input=false -lock-timeout=5m
+        working-directory: terraform/env/${{ matrix.environment }}
+
+      - name: plan
+        id: plan
+        run: |
+          set -o pipefail
+          # -lock=false: this never writes state, and holding the lock would
+          # block a real deployment behind a monitoring job.
+          terraform plan -input=false -lock=false -no-color -out=tfplan \
+            -detailed-exitcode 2>&1 | tee plan.txt || EXIT=$?
+
+          case "${EXIT:-0}" in
+            0) echo "drift=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "drift=true"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::plan failed for ${{ matrix.environment }}"; exit 1 ;;
+          esac
+        working-directory: terraform/env/${{ matrix.environment }}
+
+      - name: summarise change set
+        if: steps.plan.outputs.drift == 'true'
+        run: |
+          set -euo pipefail
+          terraform show -json tfplan \
+            | jq -r '[.resource_changes[]
+                      | select(.change.actions != ["no-op"])
+                      | "\(.address) \(.change.actions | join(","))"]
+                     | sort | .[]' > changeset.txt
+          {
+            echo "### Drift — \`${{ matrix.environment }}\`"
+            echo ""
+            echo '```'
+            cat changeset.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        working-directory: terraform/env/${{ matrix.environment }}
+
+      # One issue per environment, reused. A new issue every night for the same
+      # unfixed drift is how a team learns to filter the label out of their inbox.
+      - name: open or update drift issue
+        if: steps.plan.outputs.drift == 'true'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const dir = `terraform/env/${env}`;
+            const changes = fs.readFileSync(`${dir}/changeset.txt`, 'utf8').trim();
+            let plan = fs.readFileSync(`${dir}/plan.txt`, 'utf8');
+            const LIMIT = 50000;
+            if (plan.length > LIMIT) {
+              plan = '...(truncated, see the workflow run)...\n' + plan.slice(-LIMIT);
+            }
+
+            const marker = `<!-- drift:${env} -->`;
+            const title = `Terraform drift detected in \`${env}\``;
+            const body = [
+              marker,
+              `Detected by [run ${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) on \`${new Date().toISOString().slice(0, 10)}\`.`,
+              '',
+              'Real infrastructure no longer matches `main`. Reconcile by either',
+              'writing the change into Terraform, or reverting it in the console and',
+              'letting the next run confirm it is clean.',
+              '',
+              '### Change set',
+              '```',
+              changes,
+              '```',
+              '<details><summary>full plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: 'infra-drift',
+            });
+            const existing = open.find(i => i.body && i.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.update({
+                ...context.repo, issue_number: existing.number, body,
+              });
+              core.notice(`updated drift issue #${existing.number} for ${env}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                ...context.repo, title, body, labels: ['infra-drift'],
+              });
+              core.notice(`opened drift issue #${created.number} for ${env}`);
+            }
+
+      # Closing on its own matters as much as opening. An issue tracker full of
+      # stale drift reports that were fixed weeks ago is one nobody trusts.
+      - name: close drift issue when clean
+        if: steps.plan.outputs.drift == 'false'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        with:
+          script: |
+            const env = process.env.ENVIRONMENT;
+            const marker = `<!-- drift:${env} -->`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: 'infra-drift',
+            });
+            for (const issue of open.filter(i => i.body && i.body.includes(marker))) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: issue.number,
+                body: `Resolved — \`${env}\` now matches \`main\` as of run ${context.runId}.`,
+              });
+              await github.rest.issues.update({
+                ...context.repo, issue_number: issue.number, state: 'closed',
+              });
+              core.notice(`closed drift issue #${issue.number} for ${env}`);
+            }
