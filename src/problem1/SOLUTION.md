@@ -74,7 +74,7 @@ flowchart LR
             subgraph ASYNC["Async: feature refresh & training"]
                 Events(["Risk events"])
                 Worker["Feature Worker"]
-                ClickHouse[("Offline ClickHouse")]
+                ClickHouse[("ClickHouse")]
                 Training["Training job"]
 
                 Worker --> ClickHouse
